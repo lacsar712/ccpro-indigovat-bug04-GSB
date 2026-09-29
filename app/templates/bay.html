@@ -83,7 +83,8 @@
         <div class="panel-grid">
           <div>
             <h3 style="font-size:1rem;margin:0 0 0.65rem;color:#1f4d6b">登记浸染</h3>
-            <form method="post" :action="'/bay/vats/' + selected().id + '/lots'">
+            <form method="post" :action="'/bay/vats/' + selected().id + '/lots'"
+                  @submit="lockSubmit($event)">
               <input type="hidden" name="workshop" :value="filterWs || ''">
               <label>浸染时间
                 <input type="datetime-local" name="dippedAt" required :value="nowLocal()">
@@ -99,7 +100,8 @@
           </div>
           <div>
             <h3 style="font-size:1rem;margin:0 0 0.65rem;color:#1f4d6b">改缸状态</h3>
-            <form method="post" :action="'/bay/vats/' + selected().id + '/status'">
+            <form method="post" :action="'/bay/vats/' + selected().id + '/status'"
+                  @submit="lockSubmit($event)">
               <input type="hidden" name="workshop" :value="filterWs || ''">
               <label>目标状态
                 <select name="status" required :value="selected().status">
@@ -181,6 +183,20 @@
         const d = new Date();
         d.setMinutes(d.getMinutes() - d.getTimezoneOffset());
         return d.toISOString().slice(0, 16);
+      },
+      lockSubmit(event) {
+        // 连点提交会落两笔/半截残行：首点后立即禁用提交钮并拦截后续点击；
+        // 失败时服务端整页重渲（400），按钮随新页面恢复可用。
+        const form = event.target;
+        if (form.dataset.locked === '1') {
+          event.preventDefault();
+          return;
+        }
+        form.dataset.locked = '1';
+        form.querySelectorAll('button[type="submit"]').forEach(btn => {
+          btn.disabled = true;
+          btn.style.opacity = '0.6';
+        });
       },
     };
   }

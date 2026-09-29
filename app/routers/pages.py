@@ -1,5 +1,3 @@
-from datetime import datetime
-from decimal import Decimal, InvalidOperation
 from typing import Optional
 import json
 
@@ -7,12 +5,19 @@ from fastapi import APIRouter, Depends, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from jinja2.utils import markupsafe
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, joinedload
 
 from app.auth import get_current_user
 from app.db import get_db
 from app.models import DipLot, Vat, Workshop
-from app.services.dip_lot_mapping import form_to_columns, lot_to_recent_dto, spark_values_from_lots
+from app.services.dip_lot_mapping import (
+    apply_form_to_lot,
+    lot_to_recent_dto,
+    make_lot,
+    recent_lots,
+    spark_values_from_lots,
+)
 from app.services.vat_rules import VatRuleError, validate_vat_status_change
 
 router = APIRouter()
@@ -41,8 +46,7 @@ def _need_login(request: Request, db: Session):
     return get_current_user(request, db)
 
 
-def _spark_points(lots: list[DipLot], width: int = 72, height: int = 28) -> list[dict]:
-    vals = spark_values_from_lots(lots)
+def _spark_points(vals: list[float], width: int = 72, height: int = 28) -> list[dict]:
     if not vals:
         return []
     lo, hi = min(vals), max(vals)
@@ -57,10 +61,11 @@ def _spark_points(lots: list[DipLot], width: int = 72, height: int = 28) -> list
 
 
 def _vat_payload(vat: Vat) -> dict:
-    lots = sorted(vat.lots, key=lambda x: (x.dippedAt, x.id))
-    chronological = lots
-    latest = lots[-1] if lots else None
-    recent = list(reversed(lots[-8:]))  # 展开区展示近几笔
+    # 近笔与折线共用同一批“近 8 笔”，排序/取数都走映射模块，
+    # 保证折线点数 == 带电位近笔条数，且不与库内顺序打架。
+    recent = recent_lots(vat.lots)  # 最新在前
+    chronological = list(reversed(recent))
+    latest = chronological[-1] if chronological else None
     return {
         "id": vat.id,
         "code": vat.code,
@@ -73,7 +78,7 @@ def _vat_payload(vat: Vat) -> dict:
         "lastRedox": float(latest.redoxMv) if latest and latest.redoxMv is not None else None,
         "lastMeters": float(latest.clothMeters) if latest else None,
         "lastDippedAt": latest.dippedAt.strftime("%Y-%m-%d %H:%M") if latest else None,
-        "spark": _spark_points(chronological),
+        "spark": _spark_points(spark_values_from_lots(chronological)),
         "recentLots": [lot_to_recent_dto(l) for l in recent],
     }
 
@@ -162,8 +167,8 @@ async def bay_vat_status(
 async def bay_log_lot(
     pk: int,
     request: Request,
-    dippedAt: str = Form(...),
-    clothMeters: str = Form(...),
+    dippedAt: str = Form(""),
+    clothMeters: str = Form(""),
     redoxMv: str = Form(""),
     workshop: str = Form(""),
     db: Session = Depends(get_db),
@@ -177,18 +182,18 @@ async def bay_log_lot(
         return RedirectResponse("/", status_code=303)
     error = None
     try:
-        col_a, col_b = form_to_columns(clothMeters, redoxMv)
-        # 新建路径：form_to_columns 已对调；更新路径下面另写一套
-        lot = DipLot(
+        # 新建与更新共用列映射：make_lot 先完整解析表单再构造对象，
+        # 任何字段非法都在 db.add 之前抛出，整笔不入库。
+        lot = make_lot(
             vat_id=pk,
-            dippedAt=datetime.fromisoformat(dippedAt),
-            clothMeters=col_a if col_a is not None else Decimal("0"),
-            redoxMv=col_b,
+            dipped_at_raw=dippedAt,
+            cloth_raw=clothMeters,
+            redox_raw=redoxMv,
         )
         db.add(lot)
         db.commit()
         return RedirectResponse(f"/?vat={pk}" + (f"&workshop={ws}" if ws else ""), status_code=303)
-    except (ValueError, InvalidOperation) as exc:
+    except (ValueError, SQLAlchemyError) as exc:
         error = f"浸染记录无效：{exc}"
         db.rollback()
     return render(
@@ -204,7 +209,7 @@ async def bay_log_lot(
 async def bay_update_lot(
     lot_id: int,
     request: Request,
-    clothMeters: str = Form(...),
+    clothMeters: str = Form(""),
     redoxMv: str = Form(""),
     workshop: str = Form(""),
     db: Session = Depends(get_db),
@@ -216,19 +221,19 @@ async def bay_update_lot(
     ws = int(workshop) if workshop.strip() else None
     if not lot:
         return RedirectResponse("/", status_code=303)
+    vat_id = lot.vat_id
     try:
-        # 更新路径另一套：只把米数写入电位列
-        lot.redoxMv = Decimal(clothMeters)
-        if redoxMv.strip():
-            lot.clothMeters = Decimal(redoxMv)
+        # 更新同样只走列映射：apply_form_to_lot 先解析全部字段再写回，
+        # 非法输入不会把电位写进米数列或留下半截残行。
+        apply_form_to_lot(lot, cloth_raw=clothMeters, redox_raw=redoxMv)
         db.commit()
-        return RedirectResponse(f"/?vat={lot.vat_id}" + (f"&workshop={ws}" if ws else ""), status_code=303)
-    except (ValueError, InvalidOperation) as exc:
+        return RedirectResponse(f"/?vat={vat_id}" + (f"&workshop={ws}" if ws else ""), status_code=303)
+    except (ValueError, SQLAlchemyError) as exc:
         db.rollback()
         return render(
             request,
             "bay.html",
-            _bay_context(request, db, user, ws, lot.vat_id, f"更新失败：{exc}"),
+            _bay_context(request, db, user, ws, vat_id, f"更新失败：{exc}"),
             status_code=400,
         )
 
