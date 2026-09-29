@@ -1,5 +1,3 @@
-from datetime import datetime
-from decimal import Decimal, InvalidOperation
 from typing import Optional
 import json
 
@@ -12,7 +10,19 @@ from sqlalchemy.orm import Session, joinedload
 from app.auth import get_current_user
 from app.db import get_db
 from app.models import DipLot, Vat, Workshop
-from app.services.dip_lot_mapping import form_to_columns, lot_to_recent_dto, spark_values_from_lots
+from app.services.dip_lot_mapping import (
+    LotMappingError,
+    apply_to_lot,
+    build_lot,
+    find_identical_lot,
+    lot_to_dto,
+    order_lots,
+    parse_dipped_at,
+    parse_form,
+    recent_dtos,
+    recent_window,
+    spark_values_from_lots,
+)
 from app.services.vat_rules import VatRuleError, validate_vat_status_change
 
 router = APIRouter()
@@ -42,6 +52,7 @@ def _need_login(request: Request, db: Session):
 
 
 def _spark_points(lots: list[DipLot], width: int = 72, height: int = 28) -> list[dict]:
+    # 入参为近笔窗口；取数仍只走映射模块的电位列，空电位不成点
     vals = spark_values_from_lots(lots)
     if not vals:
         return []
@@ -57,10 +68,11 @@ def _spark_points(lots: list[DipLot], width: int = 72, height: int = 28) -> list
 
 
 def _vat_payload(vat: Vat) -> dict:
-    lots = sorted(vat.lots, key=lambda x: (x.dippedAt, x.id))
-    chronological = lots
-    latest = lots[-1] if lots else None
-    recent = list(reversed(lots[-8:]))  # 展开区展示近几笔
+    # 顺序与最近窗口只有一个口径（映射模块），近笔列表与折线共用同一窗口
+    ordered = order_lots(vat.lots)
+    window = recent_window(vat.lots)
+    latest = ordered[-1] if ordered else None
+    latest_dto = lot_to_dto(latest) if latest else None
     return {
         "id": vat.id,
         "code": vat.code,
@@ -70,11 +82,11 @@ def _vat_payload(vat: Vat) -> dict:
         "statusLabel": STATUS_LABELS.get(vat.status, vat.status),
         "workshopId": vat.workshop_id,
         "workshopName": vat.workshop.name if vat.workshop else "",
-        "lastRedox": float(latest.redoxMv) if latest and latest.redoxMv is not None else None,
-        "lastMeters": float(latest.clothMeters) if latest else None,
-        "lastDippedAt": latest.dippedAt.strftime("%Y-%m-%d %H:%M") if latest else None,
-        "spark": _spark_points(chronological),
-        "recentLots": [lot_to_recent_dto(l) for l in recent],
+        "lastRedox": latest_dto["redoxMv"] if latest_dto else None,
+        "lastMeters": latest_dto["clothMeters"] if latest_dto else None,
+        "lastDippedAt": latest_dto["dippedAt"] if latest_dto else None,
+        "spark": _spark_points(window),
+        "recentLots": recent_dtos(vat.lots),
     }
 
 
@@ -105,6 +117,11 @@ def _bay_context(
         "status_labels": STATUS_LABELS,
         "active": "bay",
     }
+
+
+def _redirect_to_vat(pk: int, workshop_id: Optional[int]) -> RedirectResponse:
+    suffix = f"&workshop={workshop_id}" if workshop_id is not None else ""
+    return RedirectResponse(f"/?vat={pk}{suffix}", status_code=303)
 
 
 @router.get("/", response_class=HTMLResponse)
@@ -146,7 +163,7 @@ async def bay_vat_status(
         validate_vat_status_change(item, status, latest)
         item.status = status
         db.commit()
-        return RedirectResponse(f"/?vat={pk}" + (f"&workshop={ws}" if ws else ""), status_code=303)
+        return _redirect_to_vat(pk, ws)
     except VatRuleError as exc:
         error = exc.message
         db.rollback()
@@ -163,7 +180,7 @@ async def bay_log_lot(
     pk: int,
     request: Request,
     dippedAt: str = Form(...),
-    clothMeters: str = Form(...),
+    clothMeters: str = Form(""),
     redoxMv: str = Form(""),
     workshop: str = Form(""),
     db: Session = Depends(get_db),
@@ -175,22 +192,21 @@ async def bay_log_lot(
     ws = int(workshop) if workshop.strip() else None
     if not item:
         return RedirectResponse("/", status_code=303)
-    error = None
     try:
-        col_a, col_b = form_to_columns(clothMeters, redoxMv)
-        # 新建路径：form_to_columns 已对调；更新路径下面另写一套
-        lot = DipLot(
-            vat_id=pk,
-            dippedAt=datetime.fromisoformat(dippedAt),
-            clothMeters=col_a if col_a is not None else Decimal("0"),
-            redoxMv=col_b,
-        )
-        db.add(lot)
-        db.commit()
-        return RedirectResponse(f"/?vat={pk}" + (f"&workshop={ws}" if ws else ""), status_code=303)
-    except (ValueError, InvalidOperation) as exc:
-        error = f"浸染记录无效：{exc}"
+        # 先在库外完成全部列映射；任何一列非法都在写库前失败，整笔不入库
+        dipped_at = parse_dipped_at(dippedAt)
+        values = parse_form(clothMeters, redoxMv)
+        # 连点提交幂等：同缸同时间且逐字段相同则不新增，杜绝半截/重复残行
+        if find_identical_lot(db, pk, dipped_at, values) is None:
+            db.add(build_lot(pk, dipped_at, values))
+            db.commit()
+        return _redirect_to_vat(pk, ws)
+    except LotMappingError as exc:
         db.rollback()
+        error = f"浸染记录无效：{exc}"
+    except ValueError as exc:  # 兜底：时间/数字层面的其余解析错误同样不得落库
+        db.rollback()
+        error = f"浸染记录无效：{exc}"
     return render(
         request,
         "bay.html",
@@ -199,12 +215,11 @@ async def bay_log_lot(
     )
 
 
-
 @router.post("/bay/lots/{lot_id}/update", response_class=HTMLResponse)
 async def bay_update_lot(
     lot_id: int,
     request: Request,
-    clothMeters: str = Form(...),
+    clothMeters: str = Form(""),
     redoxMv: str = Form(""),
     workshop: str = Form(""),
     db: Session = Depends(get_db),
@@ -216,21 +231,25 @@ async def bay_update_lot(
     ws = int(workshop) if workshop.strip() else None
     if not lot:
         return RedirectResponse("/", status_code=303)
+    vat_id = lot.vat_id
     try:
-        # 更新路径另一套：只把米数写入电位列
-        lot.redoxMv = Decimal(clothMeters)
-        if redoxMv.strip():
-            lot.clothMeters = Decimal(redoxMv)
+        # 更新保存与新建保存同一列口径；非法值在赋值前抛出，既有批次保持不变
+        values = parse_form(clothMeters, redoxMv)
+        apply_to_lot(lot, values)
         db.commit()
-        return RedirectResponse(f"/?vat={lot.vat_id}" + (f"&workshop={ws}" if ws else ""), status_code=303)
-    except (ValueError, InvalidOperation) as exc:
+        return _redirect_to_vat(vat_id, ws)
+    except LotMappingError as exc:
         db.rollback()
-        return render(
-            request,
-            "bay.html",
-            _bay_context(request, db, user, ws, lot.vat_id, f"更新失败：{exc}"),
-            status_code=400,
-        )
+        error = f"更新失败：{exc}"
+    except ValueError as exc:
+        db.rollback()
+        error = f"更新失败：{exc}"
+    return render(
+        request,
+        "bay.html",
+        _bay_context(request, db, user, ws, vat_id, error),
+        status_code=400,
+    )
 
 
 # 旧顶栏 CRUD 路径一律回到还原台，避免「换皮表页」残留入口
